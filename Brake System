@@ -9,8 +9,8 @@ SEEV - Sistemas Elétricos e Eletrônicos de Veículos
 TP1: Pretende-se  neste  trabalho  prático  a  implementação  de um  brake system utilizando um sistema operativo de tempo real FreeRTOS. Adicionalmente este deve ser capaz de diminuir a velocidade dos motores consoante a pressão de travagem e a regulação do brake balance.
 
 LINK: https://www.youtube.com/watch?v=G4XbLHM0U6k
-
 */
+
 
 
 #include "Arduino.h"
@@ -71,6 +71,7 @@ LINK: https://www.youtube.com/watch?v=G4XbLHM0U6k
 
 // Pins Input Brake Balance
 #define BOTAO_VERMELHO 25
+
 #define INITIAL_DUTY_FR 255
 #define INITIAL_DUTY_RR 255
 
@@ -146,7 +147,7 @@ void setup() {
 	xBotaoStart = xSemaphoreCreateCounting(10, 0);
 
 	xQueueBALANCE = xQueueCreate(1, sizeof(DATA_BALANCE)); //Criar Queue's
-	DATA_BALANCE initialData = { 6, false, false }; //Inicia a fila com estes dados na estrutura
+	DATA_BALANCE initialData = { 11, false, false }; //Inicia a fila com estes dados na estrutura
 	xQueueOverwrite(xQueueBALANCE, &initialData); //Envia para a fila BALANCE o conteudo inicial da variável
 
 	xQueuePRESSURE = xQueueCreate(1, sizeof(float));
@@ -163,22 +164,15 @@ void setup() {
 	//xQueueOverwrite(xQueueDUTY_RR, &initial_DuttyRR);
 
 	//Prioridade máxima para garantir sincronização com a interrupçãp
-	xTaskCreatePinnedToCore(vBotaoVermelho, "BotaoVermelho", 4096, NULL, 1,
-	NULL, 1);
-	xTaskCreatePinnedToCore(vTaskBALANCE_UP, "BALANCE UP", 4096, (void*) NULL,
-			1, NULL, 1); //Criar Task ++ Balance_Index
-	xTaskCreatePinnedToCore(vTaskBALANCE_DOWN, "BALANCE DOWN", 4096,
-			(void*) NULL, 1, NULL, 1); //Criar Task -- Balance_Index
-	xTaskCreatePinnedToCore(vTaskRead_Pressure, "BRAKE PRESSURE", 4096,
-			(void*) NULL, 2, NULL, 1); //Criar Task -- Ler Pressão
-	xTaskCreatePinnedToCore(vTaskBALANCE_UPDATE, "BALANCE UPDATE", 4096,
-			(void*) NULL, 2, NULL, 1); //Criar Task Update leds Balance
-	xTaskCreatePinnedToCore(vDisplay, "Display", 4096, NULL, 2, NULL, 1);
-	xTaskCreatePinnedToCore(task_motor_rear, "MotorRearTask", 2048, NULL, 2,
-	NULL, 1); // Cria a task para o Motor Rear
-	xTaskCreatePinnedToCore(task_motor_front, "MotorFrontTask", 2048, NULL, 2,
-	NULL, 1); // Cria a task para o Motor Front
-	xTaskCreatePinnedToCore(vTaskCalculo_FR, "vTaskCalculo_FR", 2048, NULL, 2,NULL, 1); // Cria a task para o Motor Front
+	xTaskCreatePinnedToCore(vBotaoVermelho, "BotaoVermelho", 4096, NULL, 3,	NULL, 1);
+	xTaskCreatePinnedToCore(vTaskBALANCE_UP, "BALANCE UP", 4096, (void*) NULL,2, NULL, 1); //Criar Task ++ Balance_Index
+	xTaskCreatePinnedToCore(vTaskBALANCE_DOWN, "BALANCE DOWN", 4096,(void*) NULL, 2, NULL, 1); //Criar Task -- Balance_Index
+	xTaskCreatePinnedToCore(vTaskRead_Pressure, "BRAKE PRESSURE", 4096,(void*) NULL, 5, NULL, 1); //Criar Task -- Ler Pressão
+	xTaskCreatePinnedToCore(vTaskBALANCE_UPDATE, "BALANCE UPDATE", 4096,(void*) NULL, 3, NULL, 1); //Criar Task Update leds Balance
+	xTaskCreatePinnedToCore(vDisplay, "Display", 4096, NULL, 3, NULL, 1);
+	xTaskCreatePinnedToCore(task_motor_rear, "MotorRearTask", 2048, NULL, 3,NULL, 1); // Cria a task para o Motor Rear
+	xTaskCreatePinnedToCore(task_motor_front, "MotorFrontTask", 2048, NULL, 3,	NULL, 1); // Cria a task para o Motor Front
+	xTaskCreatePinnedToCore(vTaskCalculo_FR, "vTaskCalculo_FR", 2048, NULL, 4,NULL, 1); // Cria a task para o Motor Front
 
 	//iniciar interrupcoes apenas dps de correr o setup e iniciar as tasks
 	attachInterrupt(digitalPinToInterrupt(BOTAO_VERMELHO), botaoVermelho,
