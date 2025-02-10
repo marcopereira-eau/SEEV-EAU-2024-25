@@ -1,0 +1,942 @@
+/*
+Nome ALUNO A- Luís Vasco Cristóvão
+Nome ALUNO B- Marco Veloso Pereira
+IPLEIRIA - Instituto Politécnico de Leiria
+ESTG - Escola Superior de Tecnologia e Gestão
+LEAU- Licenciatura em Engenharia Automóvel
+SEEV - Sistemas Elétricos e Eletrônicos de Veículos
+
+TP1: Pretende-se  neste  trabalho  prático  a  implementação  de um  brake system utilizando um sistema operativo de tempo real FreeRTOS. Adicionalmente este deve ser capaz de diminuir a velocidade dos motores consoante a pressão de travagem e a regulação do brake balance.
+
+LINK: https://www.youtube.com/watch?v=G4XbLHM0U6k
+
+*/
+
+
+#include "Arduino.h"
+#include <Adafruit_NeoPixel.h>
+#include <SPI.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_ILI9341.h>
+#include "engauto_verde.h" //logo automovel
+
+// Definições para Motor Rear (RODAR)
+#define MotorF_PIN 32
+#define MotorR_PIN 33
+
+// Definir pinos
+#define TFT_CS   15
+#define TFT_DC   26
+#define TFT_MOSI 23
+#define TFT_MISO 19
+#define TFT_SCLK 18
+#define TFT_RST -1
+
+#define PRINT_DEBUG_10
+#define PRINT_DEBUG_7
+#define PRINT_DEBUG_8
+
+//Definir o tempo de debounce dos botoes
+#define DEBOUNCE 200
+
+#define INIT_FR_DUTY 250
+
+// Configuração do Neopixel
+#define NEOPIXEL_PIN 5 // Pino DO ESP32 onde o Neopixel está conectado
+#define NUM_LED_TOTAL 21 // Número de LEDs Neopixel
+#define NUM_LEDS_BALANCE 10 // Número de LEDs Neopixel para o balanço
+#define BRIGHTNESS 30 // Definindo o brilho dos LEDs
+
+// Definindo as cores para cada LED
+#define COLOR1 pixels.Color(0, 0, 255)     // Azul
+#define COLOR2 pixels.Color(0, 128, 255)   // Azul Claro
+#define COLOR3 pixels.Color(0, 255, 255)   // Ciano
+#define COLOR4 pixels.Color(0, 255, 128)   // Verde-Azulado
+#define COLOR5 pixels.Color(0, 255, 0)     // Verde
+#define COLOR6 pixels.Color(128, 255, 0)   // Amarelo-Esverdeado
+#define COLOR7 pixels.Color(255, 255, 0)   // Amarelo
+#define COLOR8 pixels.Color(255, 128, 0)   // Laranja
+#define COLOR9 pixels.Color(255, 64, 0)    // Laranja-Avermelhado
+#define COLOR10 pixels.Color(255, 0, 0)    // Vermelho
+#define COLOR_80 pixels.Color(255, 100, 50)  // Branco
+#define COLOR_GREEN pixels.Color(0, 255, 0) // Verde Puro
+
+// Defenir os terminais
+// Pinos Input sensor pressão/potenciometro (ADC1_CH6)
+#define INPUT_PRESSURE 34
+
+// Pins Input Brake Balance
+#define PIN_FRONT 27
+#define PIN_REAR 14
+
+// Pins Input Brake Balance
+#define BOTAO_VERMELHO 25
+#define INITIAL_DUTY_FR 255
+#define INITIAL_DUTY_RR 255
+
+// Constructor: number of LEDs, pin number, LED type
+Adafruit_NeoPixel pixels(NUM_LED_TOTAL, NEOPIXEL_PIN, NEO_GRB + NEO_KHZ800);
+
+// Declaração do semáforo binário
+SemaphoreHandle_t SMF_B_FR = NULL;
+SemaphoreHandle_t SMF_B_RR = NULL;
+SemaphoreHandle_t SMF_READ_xQueuePRESSURE; //controla o acesso à queue Pressão Travões/POT
+SemaphoreHandle_t SMF_UPDATE_BALANCE = NULL; //Controla a atualização dos leds
+SemaphoreHandle_t xBotaoVermelho; // repetido - para fazer o arranque das leituras e motores
+SemaphoreHandle_t xBotaoStart; //repetido
+SemaphoreHandle_t xPWM_UPDATE; //repetido
+
+// Declaração das funções Interrupção
+void IRAM_ATTR frontButtonISR(void);
+void IRAM_ATTR rearButtonISR(void);
+void IRAM_ATTR botaoVermelho(void);
+void IRAM_ATTR contaPulsoF(void);
+void IRAM_ATTR contaPulsoR(void);
+
+//Declaração das tasks
+void vTaskBALANCE_UP(void *pvParameters);
+void vTaskBALANCE_DOWN(void *pvParameters);
+void vTaskRead_Pressure(void *pvParameters);
+void vTaskBALANCE_UPDATE(void *pvParamenters);
+void vBotaoVermelho(void *pvParameters);
+void vDisplay(void *pvParameters);
+void vBotaoVermelho(void *pvParameters);
+void task_motor_rear(void *pvParameters);
+void task_motor_front(void *pvParameters);
+void vTaskCalculo_FR(void *pvParameters);
+
+//Declar Queues
+QueueHandle_t xQueueRPM_FR, xQueueRPM_RR, xQueueBALANCE, xQueuePRESSURE,
+		xQueueDUTY_FR, xQueueDUTY_RR;
+
+// Estrutura para armazenar o estado dos botões
+typedef struct {
+	int BalanceIndex;
+	int FrontBias;
+	int RearBias;
+} DATA_BALANCE;
+
+// Pinos
+const uint8_t encoderPin_Tras = 21;
+const uint8_t encoderPin_Frente = 17;
+
+// Variável que armazena a contagem de pulsos (utilizada na rotina de interrupção)
+volatile unsigned long contadorPulsosF = 0;
+volatile unsigned long contadorPulsosR = 0;
+
+void setup() {
+
+	vTaskPrioritySet(NULL, configMAX_PRIORITIES - 1);
+	Serial.begin(115200); //Arranque porta serie
+
+	pinMode(PIN_FRONT, INPUT_PULLUP); //Configuração dos pinos
+	pinMode(PIN_REAR, INPUT_PULLUP);
+	pinMode(NEOPIXEL_PIN, OUTPUT);
+	pinMode(BOTAO_VERMELHO, INPUT_PULLUP);
+
+	pixels.begin(); //Arranque dos leds barra
+	pixels.setBrightness(BRIGHTNESS);
+	pixels.show();
+
+	SMF_B_FR = xSemaphoreCreateBinary(); //Criar o smaforo binário para aceder à task
+	SMF_B_RR = xSemaphoreCreateBinary();
+	SMF_UPDATE_BALANCE = xSemaphoreCreateBinary();
+	xBotaoVermelho = xSemaphoreCreateBinary(); //Repetido
+	xPWM_UPDATE = xSemaphoreCreateBinary(); //Repetido
+	xBotaoStart = xSemaphoreCreateCounting(10, 0);
+
+	xQueueBALANCE = xQueueCreate(1, sizeof(DATA_BALANCE)); //Criar Queue's
+	DATA_BALANCE initialData = { 6, false, false }; //Inicia a fila com estes dados na estrutura
+	xQueueOverwrite(xQueueBALANCE, &initialData); //Envia para a fila BALANCE o conteudo inicial da variável
+
+	xQueuePRESSURE = xQueueCreate(1, sizeof(float));
+
+	xQueueRPM_FR = xQueueCreate(1, sizeof(float));
+	xQueueRPM_RR = xQueueCreate(1, sizeof(float));
+
+	xQueueDUTY_FR = xQueueCreate(1, sizeof(int));
+	int initial_DutyFR = INITIAL_DUTY_FR;
+	xQueueOverwrite(xQueueDUTY_FR, &initial_DutyFR);
+
+	//xQueueDUTY_RR = xQueueCreate(1, sizeof(int));
+	//int initial_DuttyRR = 0;
+	//xQueueOverwrite(xQueueDUTY_RR, &initial_DuttyRR);
+
+	//Prioridade máxima para garantir sincronização com a interrupçãp
+	xTaskCreatePinnedToCore(vBotaoVermelho, "BotaoVermelho", 4096, NULL, 1,
+	NULL, 1);
+	xTaskCreatePinnedToCore(vTaskBALANCE_UP, "BALANCE UP", 4096, (void*) NULL,
+			1, NULL, 1); //Criar Task ++ Balance_Index
+	xTaskCreatePinnedToCore(vTaskBALANCE_DOWN, "BALANCE DOWN", 4096,
+			(void*) NULL, 1, NULL, 1); //Criar Task -- Balance_Index
+	xTaskCreatePinnedToCore(vTaskRead_Pressure, "BRAKE PRESSURE", 4096,
+			(void*) NULL, 2, NULL, 1); //Criar Task -- Ler Pressão
+	xTaskCreatePinnedToCore(vTaskBALANCE_UPDATE, "BALANCE UPDATE", 4096,
+			(void*) NULL, 2, NULL, 1); //Criar Task Update leds Balance
+	xTaskCreatePinnedToCore(vDisplay, "Display", 4096, NULL, 2, NULL, 1);
+	xTaskCreatePinnedToCore(task_motor_rear, "MotorRearTask", 2048, NULL, 2,
+	NULL, 1); // Cria a task para o Motor Rear
+	xTaskCreatePinnedToCore(task_motor_front, "MotorFrontTask", 2048, NULL, 2,
+	NULL, 1); // Cria a task para o Motor Front
+	xTaskCreatePinnedToCore(vTaskCalculo_FR, "vTaskCalculo_FR", 2048, NULL, 2,NULL, 1); // Cria a task para o Motor Front
+
+	//iniciar interrupcoes apenas dps de correr o setup e iniciar as tasks
+	attachInterrupt(digitalPinToInterrupt(BOTAO_VERMELHO), botaoVermelho,
+	RISING);
+	attachInterrupt(digitalPinToInterrupt(PIN_FRONT), frontButtonISR, FALLING); //Inicio das interrupções
+	attachInterrupt(digitalPinToInterrupt(PIN_REAR), rearButtonISR, FALLING);
+
+	/* Nunca chega a este ponto.
+	 * Scheduler está a correr neste ponto.
+	 * Se aqui chegarmos, é provável que tenha havido  heap memory insuficiente
+	 * disponível para que um recurso seja criado. */
+	//for (;;)
+	//Serial.println("Não devia chegar a este ponto !!!");
+	//  return 0;
+}
+
+// Funções de interrupção
+void IRAM_ATTR frontButtonISR() {
+	BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+	detachInterrupt(digitalPinToInterrupt(PIN_FRONT));
+	xSemaphoreGiveFromISR(SMF_B_FR, &xHigherPriorityTaskWoken);
+}
+
+void IRAM_ATTR rearButtonISR() {
+	BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+	detachInterrupt(digitalPinToInterrupt(PIN_REAR));
+	xSemaphoreGiveFromISR(SMF_B_RR, &xHigherPriorityTaskWoken);
+}
+
+//Função Interrupçao Botão Vermelho
+void IRAM_ATTR botaoVermelho() {
+	BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+	xSemaphoreGiveFromISR(xBotaoVermelho, &xHigherPriorityTaskWoken);//Sincronizar a interrupção com a Task vBotaoVermelho
+}
+
+//Funções de interrupção ddo contaddor de pulsos
+void IRAM_ATTR contaPulsoF() {
+	contadorPulsosF++;
+}
+
+void IRAM_ATTR contaPulsoR() {
+	contadorPulsosR++;
+}
+
+//Função Interrupçao Botão Start
+void vBotaoVermelho(void *pvParameters) {
+	long tempoAtual = 0, tempoUltimo = 0;
+#ifdef PRINT_DEBUG_1
+	Serial.println(" SETUP vBotaoVermelho");
+#endif
+	while (true) {
+		//Fica à espera infinitamente pelo semaforor dado pela interrupção
+		if (xSemaphoreTake(xBotaoVermelho, portMAX_DELAY)) {
+#ifdef PRINT_DEBUG_1
+	Serial.println(" LOOP vBotaoVermelho");
+#endif
+			//Quando recebe o semafororo, este dá o semaforor do staer para iniciar o sistema
+			for (int i = 0; i < 8; i++)
+				xSemaphoreGive(xBotaoStart);
+			//Debounce com task delay
+			vTaskDelay(DEBOUNCE / portTICK_PERIOD_MS);
+		}
+	}
+}
+
+// Task Botão FR
+void vTaskBALANCE_UP(void *pvParameters) {
+
+	DATA_BALANCE var_balance_data;
+
+#ifdef PRINT_DEBUG_2
+	Serial.println(" SETUP vTaskBALANCE_UP");
+#endif
+	for (;;) {
+#ifdef PRINT_DEBUG_2
+	Serial.println(" LOOP vTaskBALANCE_UP");
+#endif
+		xSemaphoreTake(SMF_B_FR, portMAX_DELAY); // Verifica se o botão frontal foi pressionado
+
+		if (xQueuePeek(xQueueBALANCE, &var_balance_data,
+		portMAX_DELAY) == pdTRUE) {	// Espera até que haja dados na fila
+			//Serial.print("BalanceIndex original: ");
+			//Serial.println(var_balance_data.BalanceIndex);
+
+			if (var_balance_data.BalanceIndex < 11) {
+				var_balance_data.BalanceIndex++;
+				//#ifdef PRINT_DEBUG
+				//Serial.print("BalanceIndex incrementado: ");
+				//Serial.println(var_balance_data.BalanceIndex);
+				//#endif
+			}
+			xQueueOverwrite(xQueueBALANCE, &var_balance_data); //Envia para a fila BALANCE o conteudo atualizado
+			//#ifdef PRINT_DEBUG
+			//Serial.println("Fila Incrementada");
+			//#endif
+		}
+		vTaskDelay(DEBOUNCE / portTICK_PERIOD_MS);
+		attachInterrupt(digitalPinToInterrupt(PIN_FRONT), frontButtonISR,
+		FALLING);
+		if (xSemaphoreGive(SMF_UPDATE_BALANCE) == pdTRUE) {
+			//#ifdef PRINT_DEBUG
+			//Serial.println("Semaforo dado com sucesso.");
+			//#endif
+		} //else {
+		  //#ifdef PRINT_DEBUG
+		  //Serial.println("Falha ao dar o semaforo.");
+		  //#endif
+		  //}
+	}
+}
+
+// Task Botão RR
+void vTaskBALANCE_DOWN(void *pvParameters) {
+
+	DATA_BALANCE var_balance_data;
+#ifdef PRINT_DEBUG_3
+	Serial.println(" SETUP vTaskBALANCE_DOWN");
+#endif
+	for (;;) {
+#ifdef PRINT_DEBUG_3
+	Serial.println(" LOOP vTaskBALANCE_DOWN");
+#endif
+		xSemaphoreTake(SMF_B_RR, portMAX_DELAY); // Verifica se o botão traseiro foi pressionado
+
+		if (xQueuePeek(xQueueBALANCE, &var_balance_data,
+		portMAX_DELAY) == pdTRUE) {	// Espera até que haja dados na fila
+			//#ifdef PRINT_DEBUG
+			//Serial.print("BalanceIndex original: ");
+			//Serial.println(var_balance_data.BalanceIndex);
+			//#endif
+			if (var_balance_data.BalanceIndex > 1) {
+				var_balance_data.BalanceIndex--;
+				//#ifdef PRINT_DEBUG
+				//Serial.print("BalanceIndex incrementado: ");
+				//Serial.println(var_balance_data.BalanceIndex);
+				//#endif
+			}
+			xQueueOverwrite(xQueueBALANCE, &var_balance_data); //Envia para a fila BALANCE o conteudo atualizado
+			//#ifdef PRINT_DEBUG
+			//Serial.println("Fila Incrementada");
+			//#endif
+		}
+		vTaskDelay(DEBOUNCE / portTICK_PERIOD_MS);
+		attachInterrupt(digitalPinToInterrupt(PIN_REAR), rearButtonISR,
+		FALLING);
+		if (xSemaphoreGive(SMF_UPDATE_BALANCE) == pdTRUE) {
+			//#ifdef PRINT_DEBUG
+			//Serial.println("Semaforo dado com sucesso.");
+			//#endif
+		} //else {
+		  //#ifdef PRINT_DEBUG
+		  //Serial.println("Falha ao dar o semaforo.");
+		  //#endif
+		  //}
+	}
+}
+
+// Task obter Pressão
+//Escreve o valor do sensor para a xQueuePRESSURE implementando padrão de design gatekeeper
+void vTaskRead_Pressure(void *Parameters) {	//ao criar a tarefa foi confirmado se existiam smf e fila criadas e prontas
+
+	int var_potValue;
+	float var_tensao;
+
+	if (xSemaphoreTake(xBotaoStart, portMAX_DELAY) == pdTRUE) { //Semáforo da ISR do BotãoStart - Arranca
+		//xSemaphoreGive(xBotaoStart); //Devolve semáforo
+
+#ifdef PRINT_DEBUG_4
+		Serial.println(" SETUP vTaskRead_Pressure");
+#endif
+		for (;;) {
+#ifdef PRINT_DEBUG_4
+			Serial.println(" LOOP vTaskRead_Pressure");
+#endif
+			vTaskDelay(100 / portTICK_PERIOD_MS);
+			var_potValue = analogRead(INPUT_PRESSURE);
+			var_tensao = var_potValue * (5.0 / 4095.0); //potenciometro de 10k (5.0 V/10000 ohm) - sensor 4095 pontos
+			xQueueOverwrite(xQueuePRESSURE, &var_tensao);
+			xSemaphoreGive(xPWM_UPDATE);
+			//#ifdef PRINT_DEBUG
+			//Serial.print(var_potValue);
+			//Serial.print("Valor da pressao lido: ");
+			//Serial.println(var_tensao);
+			//#endif
+		}
+	}
+}
+
+// Função para atualizar os LEDs
+void vTaskBALANCE_UPDATE(void *Parameters) {
+	DATA_BALANCE var_estrutura;
+	float var_pressure_pot = 10;
+	int var_balance_index = 1;
+	int var_tensao = 15;
+	int numLeds = 0;
+	int var_pressure_leds = 10;
+
+#ifdef PRINT_DEBUG_5
+	Serial.println(" SETUP vTaskBALANCE_UPDATE");
+#endif
+	for (;;) {
+#ifdef PRINT_DEBUG_5
+	Serial.println(" LOOP vTaskBALANCE_UPDATE");
+#endif
+		xQueuePeek(xQueueBALANCE, &var_estrutura, portMAX_DELAY);
+		//#ifdef PRINT_DEBUG
+		//Serial.print("Valor do index na queue: ");
+		//Serial.println(var_estrutura.BalanceIndex);
+		//#endif
+
+		xQueuePeek(xQueuePRESSURE, &var_pressure_pot, portMAX_DELAY);
+
+		if (var_pressure_pot >= 0.5) {
+			numLeds = (var_pressure_pot - 0.5) / 0.4 + 1;
+			if (numLeds > var_pressure_leds) {
+				numLeds = var_pressure_leds;
+			}
+		}
+		for (int i = 0; i < var_pressure_leds; i++) {
+			if (i < numLeds) {
+				switch (i) {
+				case 0:
+					pixels.setPixelColor(i, COLOR1);
+					break;
+				case 1:
+					pixels.setPixelColor(i, COLOR2);
+					break;
+				case 2:
+					pixels.setPixelColor(i, COLOR3);
+					break;
+				case 3:
+					pixels.setPixelColor(i, COLOR4);
+					break;
+				case 4:
+					pixels.setPixelColor(i, COLOR5);
+					break;
+				case 5:
+					pixels.setPixelColor(i, COLOR6);
+					break;
+				case 6:
+					pixels.setPixelColor(i, COLOR7);
+					break;
+				case 7:
+					pixels.setPixelColor(i, COLOR8);
+					break;
+				case 8:
+					pixels.setPixelColor(i, COLOR9);
+					break;
+				case 9:
+					pixels.setPixelColor(i, COLOR10);
+					break;
+				}
+			} else {
+				pixels.setPixelColor(i, pixels.Color(0, 0, 0));
+			}
+		}
+		pixels.show();
+
+		switch (var_estrutura.BalanceIndex) {
+		case 1:
+			pixels.setPixelColor(10, COLOR_GREEN);
+			pixels.setPixelColor(11, COLOR_80);
+			pixels.setPixelColor(12, COLOR_80);
+			pixels.setPixelColor(13, COLOR_80);
+			pixels.setPixelColor(14, COLOR_80);
+			pixels.setPixelColor(15, COLOR_80);
+			pixels.setPixelColor(16, COLOR_80);
+			pixels.setPixelColor(17, COLOR_80);
+			pixels.setPixelColor(18, COLOR_80);
+			pixels.setPixelColor(19, COLOR_80);
+			pixels.setPixelColor(20, COLOR_80);
+			break;
+		case 2:
+			pixels.setPixelColor(10, COLOR_80);
+			pixels.setPixelColor(11, COLOR_GREEN);
+			pixels.setPixelColor(12, COLOR_80);
+			pixels.setPixelColor(13, COLOR_80);
+			pixels.setPixelColor(14, COLOR_80);
+			pixels.setPixelColor(15, COLOR_80);
+			pixels.setPixelColor(16, COLOR_80);
+			pixels.setPixelColor(17, COLOR_80);
+			pixels.setPixelColor(18, COLOR_80);
+			pixels.setPixelColor(19, COLOR_80);
+			pixels.setPixelColor(20, COLOR_80);
+			break;
+		case 3:
+			pixels.setPixelColor(10, COLOR_80);
+			pixels.setPixelColor(11, COLOR_80);
+			pixels.setPixelColor(12, COLOR_GREEN);
+			pixels.setPixelColor(13, COLOR_80);
+			pixels.setPixelColor(14, COLOR_80);
+			pixels.setPixelColor(15, COLOR_80);
+			pixels.setPixelColor(16, COLOR_80);
+			pixels.setPixelColor(17, COLOR_80);
+			pixels.setPixelColor(18, COLOR_80);
+			pixels.setPixelColor(19, COLOR_80);
+			pixels.setPixelColor(20, COLOR_80);
+			break;
+		case 4:
+			pixels.setPixelColor(10, COLOR_80);
+			pixels.setPixelColor(11, COLOR_80);
+			pixels.setPixelColor(12, COLOR_80);
+			pixels.setPixelColor(13, COLOR_GREEN);
+			pixels.setPixelColor(14, COLOR_80);
+			pixels.setPixelColor(15, COLOR_80);
+			pixels.setPixelColor(16, COLOR_80);
+			pixels.setPixelColor(17, COLOR_80);
+			pixels.setPixelColor(18, COLOR_80);
+			pixels.setPixelColor(19, COLOR_80);
+			pixels.setPixelColor(20, COLOR_80);
+			break;
+		case 5:
+			pixels.setPixelColor(10, COLOR_80);
+			pixels.setPixelColor(11, COLOR_80);
+			pixels.setPixelColor(12, COLOR_80);
+			pixels.setPixelColor(13, COLOR_80);
+			pixels.setPixelColor(14, COLOR_GREEN);
+			pixels.setPixelColor(15, COLOR_80);
+			pixels.setPixelColor(16, COLOR_80);
+			pixels.setPixelColor(17, COLOR_80);
+			pixels.setPixelColor(18, COLOR_80);
+			pixels.setPixelColor(19, COLOR_80);
+			pixels.setPixelColor(20, COLOR_80);
+			break;
+		case 6:
+			pixels.setPixelColor(10, COLOR_80);
+			pixels.setPixelColor(11, COLOR_80);
+			pixels.setPixelColor(12, COLOR_80);
+			pixels.setPixelColor(13, COLOR_80);
+			pixels.setPixelColor(14, COLOR_80);
+			pixels.setPixelColor(15, COLOR_GREEN);
+			pixels.setPixelColor(16, COLOR_80);
+			pixels.setPixelColor(17, COLOR_80);
+			pixels.setPixelColor(18, COLOR_80);
+			pixels.setPixelColor(19, COLOR_80);
+			pixels.setPixelColor(20, COLOR_80);
+			break;
+		case 7:
+			pixels.setPixelColor(10, COLOR_80);
+			pixels.setPixelColor(11, COLOR_80);
+			pixels.setPixelColor(12, COLOR_80);
+			pixels.setPixelColor(13, COLOR_80);
+			pixels.setPixelColor(14, COLOR_80);
+			pixels.setPixelColor(15, COLOR_80);
+			pixels.setPixelColor(16, COLOR_GREEN);
+			pixels.setPixelColor(17, COLOR_80);
+			pixels.setPixelColor(18, COLOR_80);
+			pixels.setPixelColor(19, COLOR_80);
+			pixels.setPixelColor(20, COLOR_80);
+			break;
+		case 8:
+			pixels.setPixelColor(10, COLOR_80);
+			pixels.setPixelColor(11, COLOR_80);
+			pixels.setPixelColor(12, COLOR_80);
+			pixels.setPixelColor(13, COLOR_80);
+			pixels.setPixelColor(14, COLOR_80);
+			pixels.setPixelColor(15, COLOR_80);
+			pixels.setPixelColor(16, COLOR_80);
+			pixels.setPixelColor(17, COLOR_GREEN);
+			pixels.setPixelColor(18, COLOR_80);
+			pixels.setPixelColor(19, COLOR_80);
+			pixels.setPixelColor(20, COLOR_80);
+			break;
+		case 9:
+			pixels.setPixelColor(10, COLOR_80);
+			pixels.setPixelColor(11, COLOR_80);
+			pixels.setPixelColor(12, COLOR_80);
+			pixels.setPixelColor(13, COLOR_80);
+			pixels.setPixelColor(14, COLOR_80);
+			pixels.setPixelColor(15, COLOR_80);
+			pixels.setPixelColor(16, COLOR_80);
+			pixels.setPixelColor(17, COLOR_80);
+			pixels.setPixelColor(18, COLOR_GREEN);
+			pixels.setPixelColor(19, COLOR_80);
+			pixels.setPixelColor(20, COLOR_80);
+			break;
+		case 10:
+			pixels.setPixelColor(10, COLOR_80);
+			pixels.setPixelColor(11, COLOR_80);
+			pixels.setPixelColor(12, COLOR_80);
+			pixels.setPixelColor(13, COLOR_80);
+			pixels.setPixelColor(14, COLOR_80);
+			pixels.setPixelColor(15, COLOR_80);
+			pixels.setPixelColor(16, COLOR_80);
+			pixels.setPixelColor(17, COLOR_80);
+			pixels.setPixelColor(18, COLOR_80);
+			pixels.setPixelColor(19, COLOR_GREEN);
+			pixels.setPixelColor(20, COLOR_80);
+			break;
+		case 11:
+			pixels.setPixelColor(10, COLOR_80);
+			pixels.setPixelColor(11, COLOR_80);
+			pixels.setPixelColor(12, COLOR_80);
+			pixels.setPixelColor(13, COLOR_80);
+			pixels.setPixelColor(14, COLOR_80);
+			pixels.setPixelColor(15, COLOR_80);
+			pixels.setPixelColor(16, COLOR_80);
+			pixels.setPixelColor(17, COLOR_80);
+			pixels.setPixelColor(18, COLOR_80);
+			pixels.setPixelColor(19, COLOR_80);
+			pixels.setPixelColor(20, COLOR_GREEN);
+			break;
+		}
+		pixels.show();
+
+		xSemaphoreGive(SMF_UPDATE_BALANCE);
+	}
+}
+
+// Task para configurar e manter o PWM do motor rear
+void task_motor_rear(void *pvParameters) {
+	TickType_t xLastWakeTime;
+	int freq = 1000;
+	//int ledChannel = 5;
+	int resolution = 8;
+
+	// --- Definições ---
+	const int sensorPinr = 21; // Pino do sinal do sensor da frente
+	const unsigned long intervalo_ms = 1000; // Intervalo de medição em milissegundos (1 segundo)
+	const int pulsosPorRotacao = 20; // Número de pulsos gerados por cada rotação
+
+	// Variável para armazenar o tempo da última medição
+	unsigned long tempoAnterior = 0;
+
+	// Variável para armazenar os RPM calculados
+	float rpmr = 0, rpmr_filt = 0;
+	char dutyCycle = 255;
+
+	if (xSemaphoreTake(xBotaoStart, portMAX_DELAY) == pdTRUE) {
+		//xSemaphoreGive(xBotaoStart);
+
+		char dutyCycle = 250;
+
+		// Configura o pino do sensor como entrada com resistor de pull-up interno
+		pinMode(encoderPin_Tras, INPUT_PULLUP);
+
+		// Configura a interrupção para o pino do sensor: chama "contaPulso" na borda de subida
+		attachInterrupt(digitalPinToInterrupt(encoderPin_Tras), contaPulsoR,
+		RISING);
+
+		/*funcao arranque motor*/
+		ledcAttach(MotorR_PIN, freq, resolution);
+
+		/*funcao conta pulsos*/
+		xLastWakeTime = xTaskGetTickCount();
+	}
+#ifdef PRINT_DEBUG_6
+	Serial.println(" SETUP task_motor_rear");
+#endif
+	for (;;) {
+#ifdef PRINT_DEBUG_6
+		Serial.println(" LOOP task_motor_rear");
+#endif
+
+		//xQueuePeek(xQ)
+		ledcWrite(MotorR_PIN, dutyCycle);
+		noInterrupts();
+
+		unsigned long pulsosr = contadorPulsosR;
+		contadorPulsosR = 0;
+		interrupts();
+
+		rpmr = (pulsosr * (60.0 * 1000.0)) / (pulsosPorRotacao * intervalo_ms);
+		rpmr_filt = 0.2 * rpmr_filt + 0.8 * rpmr;
+
+#ifdef PRINT_DEBUG_6
+		Serial.print("RPM Rear: ");
+		Serial.print(rpmr);
+		Serial.print("  |  RPM media Rear: ");
+		Serial.println(rpmr_filt);
+#endif
+		vTaskDelayUntil(&xLastWakeTime, (1000 / portTICK_PERIOD_MS));
+
+		xQueueOverwrite(xQueueRPM_RR, &rpmr_filt);
+	}
+}
+
+// Task para configurar e manter o PWM do motor front
+void task_motor_front(void *pvParameters) {
+	if (xSemaphoreTake(xBotaoStart, portMAX_DELAY) == pdTRUE) {
+
+		//xSemaphoreGive(xBotaoStart);
+
+		TickType_t xLastWakeTime;
+		int freq = 5000;
+		//int ledChannel = 5;
+		int resolution = 8;
+
+		// --- Definições ---
+		const int sensorPinf = 17; // Pino do sinal do sensor da frente
+		const unsigned long intervalo_ms = 1000; // Intervalo de medição em milissegundos (1 segundo)
+		const int pulsosPorRotacaof = 20; // Número de pulsos gerados por cada rotação
+
+		// Variável para armazenar o tempo da última medição
+		unsigned long tempoAnterior = 0;
+
+		// Variável para armazenar os RPM calculados
+		float rpmf = 0, rpmf_filt = 0;
+		char dutyCycle = INIT_FR_DUTY;
+		//xQueueOverwrite(xQueueDUTY_FR, &dutyCycle);
+		// Configura o pino do sensor como entrada com resistor de pull-up interno
+		pinMode(encoderPin_Frente, INPUT_PULLUP);
+
+		// Configura a interrupção para o pino do sensor: chama "contaPulso" na borda de subida
+		attachInterrupt(digitalPinToInterrupt(encoderPin_Frente), contaPulsoF,
+		RISING);
+
+		ledcAttach(MotorF_PIN, freq, resolution);
+
+		xLastWakeTime = xTaskGetTickCount();
+
+#ifdef PRINT_DEBUG_7
+		Serial.println(" SETUP task_motor_front");
+#endif
+		for (;;) {
+#ifdef PRINT_DEBUG_7
+			Serial.println(" LOOP task_motor_front");
+#endif
+			xQueuePeek(xQueueDUTY_FR, &dutyCycle, portMAX_DELAY);
+			ledcWrite(MotorF_PIN, dutyCycle);
+			noInterrupts();
+
+			unsigned long pulsosf = contadorPulsosF;
+
+			contadorPulsosF = 0;
+			interrupts();
+
+			rpmf = (pulsosf * (60.0 * 1000.0))
+					/ (pulsosPorRotacaof * intervalo_ms);
+			rpmf_filt = 0.2 * rpmf_filt + 0.8 * rpmf;
+			//#ifdef PRINT_DEBUG
+			//Serial.print("RPM Front: ");
+			//Serial.print(rpmf);
+			//Serial.print("  |  RPM media Front: ");
+			//Serial.println(rpmf_filt);
+			//#endif
+			vTaskDelayUntil(&xLastWakeTime, (1000 / portTICK_PERIOD_MS));
+
+			xQueueOverwrite(xQueueRPM_FR, &rpmf_filt);
+		}
+	}
+}
+
+//Task de display
+void vDisplay(void *pvParameters) {
+	char buffer[20];
+	long lastCount = 0;
+
+	DATA_BALANCE var_estrutura;
+
+	//int dummy = 990;
+	//char dummy_str[5];
+
+	// Criar um objeto tft com indicação dos terminais CS e DC
+	Adafruit_ILI9341 tft = Adafruit_ILI9341(TFT_CS, TFT_DC, TFT_MOSI, TFT_SCLK,
+	TFT_RST, TFT_MISO);
+
+	tft.begin(); // Inicializar o tft
+	tft.fillScreen(ILI9341_BLACK); // Colocar fundo preto
+	tft.setRotation(3); //Orientação do display
+
+	tft.setCursor(0, 10);
+	tft.setTextColor(ILI9341_WHITE);
+	tft.setTextSize(3);
+	tft.println("     SEEV-EAU");
+
+	tft.setTextSize(2);
+	tft.setTextColor(ILI9341_GREEN);
+	tft.println("         2024/2025");
+
+	tft.setTextSize(3);
+	tft.setTextColor(ILI9341_WHITE);
+	tft.println("\n\n   Brake System     ");
+
+	tft.setTextSize(2);
+	tft.setTextColor(ILI9341_GREEN);
+	tft.println("\n\n\n\n  L.CRISTOVAO   M.PEREIRA");
+
+	tft.setTextSize(2);
+
+	//variavel apenas para variar o texto
+	bool piscaTexto = false;
+	//o tempo que o semaforo fica a espera para ficar disponivel serve de delay para piscar o texto
+
+	while (xSemaphoreTake(xBotaoStart, 800 / portTICK_PERIOD_MS) != pdTRUE) {
+		if (piscaTexto == true) {
+			tft.setCursor(55, 160);
+			tft.setTextColor(ILI9341_RED);
+			tft.print("PRESS RED TO START");
+			//mudamos o estado para da proxima vez ir para a outra seccao do IF
+			piscaTexto = false;
+		} else {
+			tft.setCursor(55, 160);
+			tft.setTextColor(ILI9341_BLACK);
+			tft.print("PRESS RED TO START");
+			//mudamos o estado para da proxima vez ir para a outra seccao do IF
+			piscaTexto = true;
+		}
+	}
+	//Devolver o semaforo para outras tasks tb saberem que o sistema inicializou
+	//xSemaphoreGive(xBotaoStart);
+
+	// Colocar fundo preto
+	tft.fillScreen(ILI9341_BLACK);
+
+	// Desenhar/escrever conteúdos fixos:
+	//  LogoEAU
+	int altura = 34, largura = 320;   // Definicao da dimensao da imagem
+	int linha, coluna, inicio_x = 0; // Definicao de ints temporarios
+	// Ler a linha do bitmap
+	for (linha = 0; linha < altura; linha++) {
+		// Ler coluna do bitmap
+		for (coluna = 0; coluna < largura; coluna++) {
+			tft.drawPixel(coluna, linha,
+					pgm_read_word(engauto_verde + inicio_x)); // Desenhar o pixel no sitio correto
+			inicio_x++;
+		}
+	}
+
+	//Informação Pressão de travagem
+	tft.setCursor(5, 55);
+	tft.setTextColor(ILI9341_WHITE);
+	tft.setTextSize(2);
+	tft.println("Brake P: ");
+	tft.drawRect(1, 50, 160, 21, ILI9341_RED);
+	tft.drawRect(2, 51, 160, 21, ILI9341_RED); //Espessura retangulo
+	tft.setCursor(135, 60);
+	tft.setTextSize(1);
+	tft.setTextColor(ILI9341_RED);
+	tft.println("BAR");
+
+	//Informação RPM dos 2 eixos de rotação
+	//Motor 1
+	tft.setCursor(5, 100);
+	tft.drawRect(1, 95, 160, 48, ILI9341_BLUE);
+	tft.drawRect(2, 96, 160, 48, ILI9341_BLUE); //Espessura retangulo
+	tft.setTextSize(2);
+	tft.setTextColor(ILI9341_WHITE);
+	tft.println("RPM_F:");
+	tft.setCursor(135, 105);
+	tft.setTextSize(1);
+
+	//Motor 2
+	tft.setTextColor(ILI9341_WHITE);
+	tft.setCursor(5, 125);
+	tft.setTextSize(2);
+	tft.println("RPM_R:");
+	tft.setCursor(135, 130);
+	tft.setTextSize(1);
+
+	//Informação do valor de brake balance
+	tft.setTextColor(ILI9341_WHITE);
+	tft.setCursor(223, 55);
+	tft.setTextSize(2);
+	tft.println("B_Bias");
+	tft.drawRect(215, 50, 90, 150, ILI9341_YELLOW);
+	tft.drawRect(215, 51, 90, 150, ILI9341_YELLOW); //Espessura retangulo
+	tft.drawLine(215, 75, 303, 75, ILI9341_YELLOW); //Divisao
+	tft.drawLine(215, 135, 303, 135, ILI9341_YELLOW); //Divisao dos valores
+
+	//Estado do sistema
+	tft.setCursor(5, 220);
+	tft.setTextColor(ILI9341_WHITE);
+	tft.setTextSize(1);
+	tft.println("System:");
+
+#ifdef PRINT_DEBUG_8
+	Serial.println(" SETUP vDisplay");
+#endif
+	for (;;) {
+#ifdef PRINT_DEBUG_8
+		Serial.println(" LOOP vDisplay");
+#endif
+
+		float var_pressure_pot;
+		xQueuePeek(xQueuePRESSURE, &var_pressure_pot, portMAX_DELAY);
+		xQueuePeek(xQueueBALANCE, &var_estrutura, portMAX_DELAY);
+		dtostrf(var_pressure_pot, -3, 1, buffer);
+		tft.setCursor(106, 55);
+		tft.setTextColor(ILI9341_GREEN, ILI9341_BLACK);
+		tft.setTextSize(2);
+		tft.print(buffer); // VALOR DA PRESSAO DE TRAVAGEM
+
+		float rpmf_filt;
+		xQueuePeek(xQueueRPM_FR, &rpmf_filt, portMAX_DELAY);
+		sprintf(buffer, "%5.2f", rpmf_filt);
+		tft.setTextColor(ILI9341_GREEN, ILI9341_BLACK);
+		tft.setCursor(80, 100);
+		tft.println(buffer); //VALOR DA ROTAÇÃO DO MOTOR EIXO FRONTAL
+
+		float rpmr_filt;
+		xQueuePeek(xQueueRPM_RR, &rpmr_filt, portMAX_DELAY);
+		sprintf(buffer, "%5.2f", rpmr_filt);
+		tft.setTextColor(ILI9341_GREEN, ILI9341_BLACK);
+		tft.setCursor(80, 125);
+		tft.println(buffer); //VALOR DA ROTAÇÃO DO MOTOR EIXO TRASEIRO
+
+		tft.setCursor(50, 220);
+		tft.setTextColor(ILI9341_CYAN);
+		tft.setTextSize(1);
+		tft.println("ON"); //Estado do sistema
+
+		//contas
+		int FrontBias = map(var_estrutura.BalanceIndex, 1, 11, 0, 100);
+		int RearBias = 100 - FrontBias;
+
+		sprintf(buffer, "%3d", FrontBias);
+		tft.setCursor(235, 95);
+		tft.setTextSize(3);
+		tft.setTextColor(ILI9341_GREEN, ILI9341_BLACK);
+		tft.println(buffer); //VALOR DO BRAKE VALANCE FRENTE
+
+		sprintf(buffer, "%3d", RearBias);
+		tft.setCursor(235, 158);
+		tft.setTextColor(ILI9341_GREEN, ILI9341_BLACK);
+		tft.println(buffer); //VALOR DO BRAKE VALANCE TRASEIRO
+
+		vTaskDelay(250 / portTICK_PERIOD_MS); //tempo de atualização
+	}
+
+}
+
+//Task Cálculo PWM FR
+void vTaskCalculo_FR(void *pvParameters) {
+
+	DATA_BALANCE var_estado_balanco;
+	float var_pressure;
+	float var_pressure_pf;
+	int duty_fr = INIT_FR_DUTY;
+	int var_duty_fr;
+	int duty_fr_update;
+
+	while (1) {
+		if (xSemaphoreTake(xPWM_UPDATE, portMAX_DELAY) == pdTRUE) { //este semaforo só pode fazer take se houve Overwrite para xQueuePRESSURE
+
+			xQueuePeek(xQueueBALANCE, &var_estado_balanco, portMAX_DELAY);
+			xQueuePeek(xQueuePRESSURE, &var_pressure, portMAX_DELAY);
+
+			var_pressure_pf = map(var_pressure, 0 , 5 , 0 , 1);
+
+			//xQueuePeek(xQueueDUTY_FR, &var_duty_fr, portMAX_DELAY);
+			duty_fr_update = 255 - 255* (var_pressure_pf * 1);
+			duty_fr = duty_fr_update;
+
+			xQueueOverwrite(xQueueDUTY_FR, &duty_fr);
+		}
+
+	}
+}
+
+//Task Calculo PWM RR
+//void vTaskCalculo_FR(void *pvParameters) {
+//xQueuePRESSURE
+//QueueBALANCE
+
+//}*/
+void loop() {
+	vTaskDelete(NULL); //Função loop sem conteúdo
+}
+
+
